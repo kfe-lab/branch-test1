@@ -1,0 +1,133 @@
+# 실수 6·7 대응 — 정기배포 브랜치 자동 생성
+#
+# release/* → main PR이 머지될 때, 그 시각이 KST 화요일이면
+# 차주 화요일 날짜의 release/YYYY.MM.DD.01 브랜치를 자동으로 생성합니다.
+# 담당자 없이, 별도 알림 없이, 자동으로 처리됩니다.
+#
+# ── 멱등성 ───────────────────────────────────────────────────────────────
+# 같은 화요일에 여러 번 머지가 발생해도 이미 존재하는 브랜치는 재생성하지 않습니다.
+#
+# ── 수동 fallback ─────────────────────────────────────────────────────────
+# 화요일이 아닌 날 머지하거나, 자동화가 실패한 경우:
+# create-branch.yml (workflow_dispatch) 으로 수동 생성하세요.
+#
+# ── 사전 조건 (1회성 설정) ──────────────────────────────────────────────
+# create-branch.yml 과 동일한 GitHub App 설정을 사용합니다.
+# App이 없으면 GITHUB_TOKEN으로 push를 시도하므로 release/* 룰셋에서 실패할 수 있습니다.
+
+name: auto-create-release-branch
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  auto-create:
+    # release/* → main PR이 실제로 머지된 경우에만 실행
+    if: |
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: KST 화요일 여부 확인 + 차주 브랜치명 계산
+        id: date-check
+        run: |
+          # KST(Asia/Seoul) 기준 요일 확인 (1=월 ... 7=일)
+          KST_DOW=$(TZ=Asia/Seoul date +%u)
+          echo "KST 요일: $KST_DOW (2=화요일)"
+
+          if [ "$KST_DOW" != "2" ]; then
+            echo "화요일이 아닙니다. 자동 생성을 건너뜁니다."
+            echo "is_tuesday=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "화요일입니다. 차주 브랜치를 생성합니다."
+            echo "is_tuesday=true" >> "$GITHUB_OUTPUT"
+
+            # 차주 화요일 = today + 7일 (KST 기준)
+            NEXT_TUESDAY=$(TZ=Asia/Seoul date -d "+7 days" +%Y.%m.%d 2>/dev/null \
+              || TZ=Asia/Seoul date -v+7d +%Y.%m.%d)  # macOS/BSD 호환
+            NEXT_BRANCH="release/${NEXT_TUESDAY}.01"
+            echo "차주 브랜치명: $NEXT_BRANCH"
+            echo "next_branch=$NEXT_BRANCH" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: App 토큰 발급 (release/* bypass용)
+        id: app-token
+        if: steps.date-check.outputs.is_tuesday == 'true' && vars.SYNC_APP_ID != '' && secrets.SYNC_APP_PRIVATE_KEY != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        if: steps.date-check.outputs.is_tuesday == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: 중복 확인 + origin/main 기준 브랜치 생성
+        if: steps.date-check.outputs.is_tuesday == 'true'
+        env:
+          NEXT_BRANCH: ${{ steps.date-check.outputs.next_branch }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          MERGED_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # PR_NUMBER는 숫자만 허용 (injection 방지)
+          if ! printf '%s' "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+            echo "::error::PR 번호가 유효하지 않습니다."
+            exit 1
+          fi
+
+          git fetch --all --quiet
+
+          # 멱등성: 이미 존재하면 skip (에러 아님)
+          if git ls-remote --exit-code --heads origin "$NEXT_BRANCH" > /dev/null 2>&1; then
+            echo "::notice::이미 존재하는 브랜치입니다: $NEXT_BRANCH (skip)"
+            exit 0
+          fi
+
+          # 항상 origin/main HEAD 기준으로 생성
+          MAIN_SHA=$(git rev-parse origin/main)
+          echo "PR #$PR_NUMBER ($MERGED_BRANCH → main) 머지 감지"
+          echo "차주 브랜치를 origin/main ($MAIN_SHA) 기준으로 생성합니다: $NEXT_BRANCH"
+
+          # push — App 토큰이 있으면 bypass 경로, 없으면 기본 토큰
+          if [ -n "$APP_TOKEN" ]; then
+            PUSH_URL="https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          else
+            echo "::warning::App 토큰이 없습니다. GITHUB_TOKEN으로 push합니다 (release/* 룰셋이 있으면 실패할 수 있음)."
+            PUSH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          fi
+
+          if git push "$PUSH_URL" "${MAIN_SHA}:refs/heads/${NEXT_BRANCH}"; then
+            echo "✅ 차주 배포 브랜치 자동 생성됨: $NEXT_BRANCH"
+          else
+            echo "::error::브랜치 생성에 실패했습니다."
+            echo "::error::create-branch.yml 워크플로로 수동 생성하세요: $NEXT_BRANCH"
+            exit 1
+          fi
+
+      - name: Slack 알림 — 브랜치 자동 생성 완료
+        if: steps.date-check.outputs.is_tuesday == 'true' && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          NEXT_BRANCH: ${{ steps.date-check.outputs.next_branch }}
+          MERGED_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg next "$NEXT_BRANCH" \
+            --arg merged "$MERGED_BRANCH" \
+            --arg pr "$PR_NUMBER" \
+            --arg url "$RUN_URL" \
+            '{text: "📅 *차주 배포 브랜치 자동 생성됨*\n브랜치: `\($next)` (origin/main 기준)\nPR #\($pr) (`\($merged)` → main) 머지 감지\n<\($url)|Actions 로그>"}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"

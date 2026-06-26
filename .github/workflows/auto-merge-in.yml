@@ -1,13 +1,23 @@
-# 축 3 (표준화) + 축 4 (가시성) — main 전진 시 자동 merge-in
+# main → release/*, hotfix/* 자동 merge-in
 #
-# main에 새 커밋이 들어올 때마다 활성 release/*, hotfix/* 브랜치 각각에
-# merge-in PR을 자동 생성합니다. 충돌 없으면 auto-merge(squash)로 자동 완료하고,
-# 충돌 있으면 PR을 열어두고 Slack으로 수동 해소를 알립니다.
+# main에 새 커밋이 들어올 때마다 활성 release/*, hotfix/* 브랜치에 main을 흡수합니다.
 #
-# [squash-only 환경]
-# release/* 룰셋이 squash merge만 허용하므로 --merge 대신 --squash 사용.
-# PR 제목에 main SHA를 포함해 verify-sync가 동기화 여부를 추적합니다.
-# 제목 형식: "[merge-in] main → <branch> @ <short-sha>"
+# ── 정상 경로 (충돌 없음) ──────────────────────────────────────────────────
+# GitHub App 토큰(bypass 권한)으로 release/* 에 merge commit을 직접 push합니다.
+# PR·sync 브랜치 없음. merge commit 1개만 생성됩니다.
+#
+# ── 충돌 경로 ─────────────────────────────────────────────────────────────
+# 보호되지 않는 sync/main-to-<branch> 브랜치를 생성해 충돌 마커를 남깁니다.
+# PR을 열고 Slack으로 알린 뒤 개발자가 sync 브랜치에서 해소합니다.
+# 해소 후 resolve-merge-in.yml이 App 토큰으로 merge commit 머지합니다.
+#
+# ── 사전 조건 (in-repo 아님, 1회성 설정) ─────────────────────────────────
+# 1. org 소유 GitHub App 생성 (Contents/PRs/Workflows: R&W, Metadata: R)
+# 2. App을 대상 repo에 install ("Only select repositories")
+# 3. release/*, hotfix/* 룰셋 Bypass list에 App 추가 (모드: Always)
+# 4. App ID → org/repo variable: SYNC_APP_ID
+# 5. App private key (.pem) → org/repo secret: SYNC_APP_PRIVATE_KEY
+# 6. (선택) Slack Webhook → secret: SLACK_WEBHOOK_URL
 
 name: auto-merge-in
 
@@ -15,7 +25,12 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:  # 수동 재실행·디버깅용
+  workflow_dispatch:
+
+# main에 커밋이 연속으로 들어와도 직렬 실행 (race condition 방지)
+concurrency:
+  group: auto-merge-in
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -29,6 +44,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      # App 토큰 발급 — SYNC_APP_ID / SYNC_APP_PRIVATE_KEY 설정 시에만 활성
+      - name: App 토큰 발급 (bypass push용)
+        id: app-token
+        if: vars.SYNC_APP_ID != '' && secrets.SYNC_APP_PRIVATE_KEY != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+
+      - name: git 사용자 설정
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
       - name: 활성 release/*, hotfix/* 브랜치 목록 수집
         id: branches
         env:
@@ -36,7 +65,6 @@ jobs:
         run: |
           git fetch --all --quiet
 
-          # 원격 브랜치에서 release/* hotfix/* 수집 (main / HEAD 제외)
           TARGETS=$(git branch -r \
             | grep -E 'origin/(release|hotfix)/' \
             | sed 's|origin/||' \
@@ -47,18 +75,19 @@ jobs:
             echo "동기화 대상 브랜치가 없습니다."
             echo "targets=" >> "$GITHUB_OUTPUT"
           else
-            # 줄바꿈 → 공백으로 join
             JOINED=$(echo "$TARGETS" | tr '\n' ' ' | sed 's/ $//')
             echo "대상 브랜치: $JOINED"
             echo "targets=$JOINED" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 브랜치별 merge-in PR 생성
+      - name: 브랜치별 merge-in 처리
         if: steps.branches.outputs.targets != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
           MAIN_SHA: ${{ github.sha }}
           TARGETS: ${{ steps.branches.outputs.targets }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           SHORT_SHA="${MAIN_SHA:0:7}"
 
@@ -71,91 +100,135 @@ jobs:
 
             echo "--- 처리 중: $BRANCH ---"
 
-            # main과 diff가 있는지 확인 (이미 동기화된 경우 skip)
+            # 이미 동기화된 경우 skip
             DIFF_COUNT=$(git rev-list --count "origin/$BRANCH..origin/main" 2>/dev/null || echo "0")
             if [ "$DIFF_COUNT" -eq 0 ]; then
-              echo "  $BRANCH 는 이미 main과 동기화돼 있습니다. skip."
+              echo "  ✅ $BRANCH 는 이미 main과 동기화돼 있습니다. skip."
               continue
             fi
-            echo "  main이 $DIFF_COUNT 커밋 앞서 있음 → merge-in PR 생성"
+            echo "  main이 $DIFF_COUNT 커밋 앞서 있음 → merge-in 진행"
 
-            PR_TITLE="[merge-in] main → $BRANCH @ $SHORT_SHA"
+            # sync 브랜치명 (/ → -)
+            SAFE_NAME=$(echo "$BRANCH" | tr '/' '-')
+            SYNC_BRANCH="sync/main-to-$SAFE_NAME"
 
-            # 이미 open merge-in PR 있는지 확인 (중복 방지)
-            # 주의: jq '// empty' 는 일부 버전에서 exit 5 → '// ""' 로 안전하게 처리
-            EXISTING=$(gh pr list \
+            # 기존 open sync PR 확인 (중복 방지)
+            EXISTING_PR=$(gh pr list \
               --repo "$GITHUB_REPOSITORY" \
               --base "$BRANCH" \
-              --head main \
+              --head "$SYNC_BRANCH" \
               --state open \
               --limit 1 \
               --json number \
               | jq -r '.[0].number // ""')
 
-            if [ -n "$EXISTING" ]; then
-              echo "  이미 open PR #$EXISTING 이 있습니다. skip."
+            if [ -n "$EXISTING_PR" ]; then
+              echo "  이미 open sync PR #$EXISTING_PR 가 있습니다. skip."
               continue
             fi
 
-            # PR body를 tmpfile에 기록 (multiline + 특수문자 안전 처리)
-            BODY_FILE=$(mktemp)
-            jq -rn \
-              --arg branch "$BRANCH" \
-              --arg sha "$MAIN_SHA" \
-              '"## auto merge-in\n\nmain의 신규 커밋을 `\($branch)`로 흡수합니다.\n\n- main SHA: `\($sha)`\n- 동기화 방식: **squash merge** (커밋 해시 불변, force push 없음)\n\n> `verify-sync` 체크는 이 PR의 제목에서 main SHA를 파싱합니다."' \
-              > "$BODY_FILE"
+            # ── trial merge ──────────────────────────────────────────────
+            git checkout -B "work/merge-in-$SAFE_NAME" "origin/$BRANCH"
 
-            # PR 생성 — stdout(URL)과 stderr(에러) 분리
-            PR_URL=""
-            PR_ERR=""
-            PR_URL=$(gh pr create \
-              --repo "$GITHUB_REPOSITORY" \
-              --base "$BRANCH" \
-              --head main \
-              --title "$PR_TITLE" \
-              --body-file "$BODY_FILE" 2>/tmp/pr_err) || PR_ERR=$(cat /tmp/pr_err)
-            rm -f "$BODY_FILE" /tmp/pr_err
+            if git merge --no-ff --no-commit "origin/main" 2>/dev/null; then
+              # ── 정상 경로: App 토큰으로 release/* 에 직접 push ─────────
+              git commit -m "Merge main into $BRANCH @ $SHORT_SHA"
 
-            if [ -n "$PR_ERR" ]; then
-              echo "  ::warning::PR 생성 실패: $PR_ERR"
-              continue
-            fi
-            echo "  PR 생성됨: $PR_URL"
+              if [ -n "$APP_TOKEN" ]; then
+                PUSH_URL="https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+                if git push "$PUSH_URL" "HEAD:refs/heads/$BRANCH"; then
+                  echo "  ✅ merge commit 직접 push 완료 → $BRANCH"
+                else
+                  echo "  ::error::merge commit push 실패 (App bypass 설정을 확인하세요)"
+                fi
+              else
+                git merge --abort 2>/dev/null || git reset --hard "origin/$BRANCH"
+                echo "  ::warning::App 토큰이 없습니다. SYNC_APP_ID / SYNC_APP_PRIVATE_KEY를 설정하세요."
+                echo "  ::warning::정상 경로는 App 토큰 없이 동작할 수 없습니다. 충돌 없음 경로로 전환합니다."
 
-            # PR 번호 추출 (URL 마지막 숫자)
-            PR_NUMBER=$(printf '%s' "$PR_URL" | grep -oE '[0-9]+$')
-            if [ -z "$PR_NUMBER" ]; then
-              echo "  ::warning::PR 번호를 파싱하지 못했습니다 (URL: $PR_URL)"
-              continue
-            fi
+                # App 토큰이 없으면 sync 브랜치 경로로 fallback (하단 충돌 경로 재사용)
+                git checkout -B "$SYNC_BRANCH" "origin/$BRANCH"
+                git merge --no-ff "origin/main" || true
+                git add -A
+                git commit -m "merge main into $BRANCH @ $SHORT_SHA (no-conflict, App token required)"
+                git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+                  "HEAD:refs/heads/$SYNC_BRANCH"
 
-            # auto-merge 활성화 (squash — release/hotfix 룰셋에 맞춤)
-            if gh pr merge "$PR_NUMBER" \
-                --repo "$GITHUB_REPOSITORY" \
-                --squash \
-                --auto 2>/tmp/merge_err; then
-              echo "  auto-merge(squash) 활성화됨 → PR #$PR_NUMBER"
+                BODY_FILE=$(mktemp)
+                jq -rn \
+                  --arg branch "$BRANCH" \
+                  --arg sha "$MAIN_SHA" \
+                  --arg sync "$SYNC_BRANCH" \
+                  '"## merge-in (App 토큰 미설정)\n\nmain의 커밋을 `\($branch)`로 흡수합니다.\n충돌은 없지만 App 토큰이 설정되지 않아 PR 경로를 사용합니다.\n\n- main SHA: `\($sha)`\n- 동기화 방식: merge commit\n\n> SYNC_APP_ID / SYNC_APP_PRIVATE_KEY를 설정하면 직접 push로 전환됩니다."' \
+                  > "$BODY_FILE"
+                gh pr create \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --base "$BRANCH" \
+                  --head "$SYNC_BRANCH" \
+                  --title "[sync] main → $BRANCH @ $SHORT_SHA" \
+                  --body-file "$BODY_FILE" || true
+                rm -f "$BODY_FILE"
+              fi
+
             else
-              MERGE_ERR=$(cat /tmp/merge_err)
-              echo "  ::warning::auto-merge 활성화 실패: $MERGE_ERR"
-              echo "  PR을 수동으로 확인하세요: $PR_URL"
-            fi
-            rm -f /tmp/merge_err
-          done
+              # ── 충돌 경로: sync 브랜치 + PR + Slack 알림 ───────────────
+              echo "  ⚠️  충돌 감지 → sync 브랜치 경로로 전환"
+              git merge --abort 2>/dev/null || true
+              git reset --hard "origin/$BRANCH"
 
-      - name: Slack 알림 — merge-in 완료
-        if: ${{ env.SLACK_WEBHOOK_URL != '' && steps.branches.outputs.targets != '' }}
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          MAIN_SHA: ${{ github.sha }}
-          TARGETS: ${{ steps.branches.outputs.targets }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          PAYLOAD=$(jq -n \
-            --arg sha "$MAIN_SHA" \
-            --arg targets "$TARGETS" \
-            --arg url "$RUN_URL" \
-            '{text: "🔀 *auto merge-in 실행됨*\nmain `\($sha)` → 대상 브랜치: `\($targets)`\n<\($url)|Actions 로그>"}')
-          curl -s -X POST "$SLACK_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD"
+              git checkout -B "$SYNC_BRANCH" "origin/$BRANCH"
+              git merge --no-ff "origin/main" || true   # 충돌 마커 남김
+              git add -A
+              git commit -m "merge main into $BRANCH @ $SHORT_SHA — CONFLICTS, resolve before merge"
+              git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+                "HEAD:refs/heads/$SYNC_BRANCH"
+
+              # PR 생성
+              BODY_FILE=$(mktemp)
+              jq -rn \
+                --arg branch "$BRANCH" \
+                --arg sha "$MAIN_SHA" \
+                --arg sync "$SYNC_BRANCH" \
+                '"## ⚠️ merge-in 충돌\n\nmain을 `\($branch)`로 흡수하는 과정에서 충돌이 발생했습니다.\n충돌 마커를 해소하고 push하면 CI가 자동으로 merge commit 머지합니다.\n\n**충돌 해소 방법:**\n```bash\ngit fetch origin\ngit checkout \($sync)\n# 충돌 마커 수정 후:\ngit commit -am \"resolve conflicts\"\ngit push\n```\n\n- main SHA: `\($sha)`\n- 동기화 방식: merge commit (App bypass)\n\n> ⚠️ 이 PR을 수동으로 머지하지 마세요. 충돌 마커 required check가 통과되면 CI가 자동 머지합니다."' \
+                > "$BODY_FILE"
+
+              PR_URL=$(gh pr create \
+                --repo "$GITHUB_REPOSITORY" \
+                --base "$BRANCH" \
+                --head "$SYNC_BRANCH" \
+                --title "[sync] main → $BRANCH @ $SHORT_SHA (CONFLICTS)" \
+                --body-file "$BODY_FILE" 2>/dev/null || echo "")
+              rm -f "$BODY_FILE"
+
+              if [ -z "$PR_URL" ]; then
+                echo "  ::warning::PR 생성 실패 — merge-conflict 라벨이 없을 수 있음, 재시도"
+                PR_URL=$(gh pr create \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --base "$BRANCH" \
+                  --head "$SYNC_BRANCH" \
+                  --title "[sync] main → $BRANCH @ $SHORT_SHA (CONFLICTS)" \
+                  --body "⚠️ 충돌 발생. sync 브랜치 \`$SYNC_BRANCH\`에서 마커 해소 후 push하세요." \
+                  2>/dev/null || echo "")
+              fi
+
+              [ -n "$PR_URL" ] && echo "  PR 생성됨: $PR_URL" || echo "  ::error::PR 생성 실패"
+
+              # Slack 알림 (충돌 발생 시)
+              if [ -n "$SLACK_WEBHOOK_URL" ] && [ -n "$PR_URL" ]; then
+                RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+                PAYLOAD=$(jq -n \
+                  --arg branch "$BRANCH" \
+                  --arg sha "$SHORT_SHA" \
+                  --arg pr_url "$PR_URL" \
+                  --arg run_url "$RUN_URL" \
+                  --arg sync "$SYNC_BRANCH" \
+                  '{text: "⚠️ *merge-in 충돌 발생*\n`main` → `\($branch)` @ `\($sha)`\n\n수동 해소 필요:\n```\ngit fetch origin\ngit checkout \($sync)\n# 충돌 해소 후 commit & push\n```\n\n<\($pr_url)|PR 바로가기>  •  <\($run_url)|Actions 로그>"}')
+                curl -s -X POST "$SLACK_WEBHOOK_URL" \
+                  -H "Content-Type: application/json" \
+                  -d "$PAYLOAD"
+              fi
+            fi
+
+            # 로컬 임시 브랜치 정리
+            git checkout main 2>/dev/null || true
+          done

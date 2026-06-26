@@ -1,6 +1,9 @@
 # 브랜치 전략 개편: 시범 구축 결과 및 프로덕션 이행 가이드
 
-> 시범 저장소: `seungjaey/branch-test1` · 작성일: 2026-06-26
+> 시범 저장소: `seungjaey/branch-test1` · 최종 수정: 2026-06-26
+
+> 설계 의도·동작 흐름·결정 근거는 **[merge-in-automation.md](./merge-in-automation.md)** 참조.
+> 팀장 리뷰용 실행 계획(왜 이 자동화인가)은 **[branch-strategy-execution-plan.md](./branch-strategy-execution-plan.md)** 참조.
 
 ## 1. 배경 — 왜 바꾸는가
 
@@ -13,18 +16,13 @@
    흡수**(merge-in)한다. 기존 커밋 해시가 불변이고 force push가 필요 없다.
 3. **(C) 가드레일 4축** — 예방·탐지·표준화·가시성을 자동화로 보장한다.
 
-프로덕션에 적용하기 전, 실제 GitHub 저장소에서 두 가설을 검증했다.
-
-- **가설 ①**: merge-in은 force push·커밋 손실 없이 동기화된다.
-- **가설 ②**: 자동화로 동기화 toil을 제거할 수 있다.
-
 ## 2. 가드레일 4축 — 무엇을 구축했나
 
 | 축 | 목적 | 구현 | 상태 |
 |----|------|------|------|
 | **예방** | force push·삭제를 플랫폼이 거부 | Branch Rulesets (`non_fast_forward`, `deletion`, `pull_request`) | ✅ |
 | **탐지** | 우회 force push 감사 + 미동기화 차단 | `detect-force-push.yml`, `verify-sync.yml` | ✅ |
-| **표준화** | merge-in을 자동/반자동으로 수행 | `auto-merge-in.yml`, `scripts/sync-release.sh` | ✅ |
+| **표준화** | merge-in을 자동/반자동으로 수행 | `auto-merge-in.yml`, `resolve-merge-in.yml`, `scripts/sync-release.sh` | ✅ |
 | **가시성** | 자동화 결과·이상을 Slack 통보 | 워크플로 내 Slack webhook 스텝 | ✅ (Secret 설정 시 활성) |
 
 ### 산출물
@@ -32,42 +30,70 @@
 ```
 .github/workflows/detect-force-push.yml   # 축 2 — force push 감사 (이중방어)
 .github/workflows/verify-sync.yml         # 축 2 — release→main PR 동기화 검증 (required check)
-.github/workflows/auto-merge-in.yml       # 축 3 — main 전진 시 merge-in PR 자동 생성+auto-merge
+.github/workflows/auto-merge-in.yml       # 축 3 — main 전진 시 merge-in 자동 처리
+.github/workflows/resolve-merge-in.yml   # 축 3 — 충돌 해소 후 sync PR 자동 머지
 scripts/sync-release.sh                   # 축 3 — 수동 merge-in 헬퍼
 ```
 
 ## 3. 동작 방식
 
-### 3.1 평상시 흐름
+### 3.1 머지 방식 설계 원칙
+
+| 경로 | 머지 방식 | 이유 |
+|------|----------|------|
+| **feature → release** | squash | 피처 커밋을 단일 커밋으로 압축, release history 간결 유지 |
+| **main → release** | merge commit | git ancestry 보존 → `verify-sync` 단순화, 충돌 해소 경로 확보 |
+
+> **룰셋은 소스 브랜치를 구분하지 못한다.** `release/*` 룰셋은 squash-only로 유지하되,
+> `main → release` merge commit은 **GitHub App bypass**로 처리한다.
+> feature PR은 App bypass가 없으므로 룰셋에 따라 자동으로 squash만 허용된다.
+
+### 3.2 정상 경로 (충돌 없음)
 
 ```
-1. 피처 개발  →  release/* 에 squash merge
-2. 배포       →  release/* → main 머지
-3. 자동 동기화 →  main 전진 감지
-                   auto-merge-in 워크플로 실행
-                   └─ 각 release/*, hotfix/*에 merge-in PR 자동 생성
-                      └─ 충돌 없으면 auto-merge(squash)로 자동 완료
-                         충돌 있으면 PR 유지 + Slack 알림 → 수동 해소
-4. 다음 배포 PR → verify-sync 가 merge-in 완료 여부 검사
-                   미동기화 → required status check 실패 → 머지 차단
-                   동기화 완료 → 통과
+main 커밋 push
+  └─ auto-merge-in 워크플로 실행
+       └─ 각 release/*, hotfix/* 브랜치에 대해:
+            trial merge (로컬 work 브랜치) 시도
+            ├─ 충돌 없음 → App 토큰으로 release/* 에 merge commit 직접 push
+            │              (App bypass가 squash-only 룰셋을 우회)
+            └─ 충돌 있음 → sync/* 브랜치 생성 + PR 열기 + Slack 알림
 ```
 
-### 3.2 squash-only 제약과 PR 기반 추적 (핵심 설계 포인트)
+정상 경로는 PR이 없다. merge commit 1개만 생성되며 main이 release/*의 직접 조상이 된다.
 
-`release`·`hotfix` 룰셋이 **squash merge만 허용**한다. squash는 git ancestry를 보존하지
-않으므로 `git merge-base --is-ancestor` 기반 동기화 검사가 불가능하다.
+### 3.3 충돌 경로
 
-→ **PR 제목을 계약(contract)으로 사용**해 우회했다.
+```
+충돌 감지
+  └─ sync/main-to-<branch> 브랜치 생성 (충돌 마커 포함)
+  └─ PR: sync/* → release/* 생성
+  └─ Slack 알림
 
-- `auto-merge-in`(및 `sync-release.sh`)이 만드는 merge-in PR 제목 형식:
+개발자:
+  git fetch origin
+  git checkout sync/main-to-<branch>
+  # 충돌 마커 해소 후:
+  git commit -am "resolve conflicts"
+  git push
 
-  ```
-  [merge-in] main → <branch> @ <short-sha>
-  ```
+  └─ resolve-merge-in 워크플로 실행
+       ├─ 충돌 마커 잔존 검사 (required check — 마커 있으면 차단)
+       └─ 마커 없음 → App 토큰으로 PR을 merge commit 머지
+```
 
-- `verify-sync`는 GitHub PR API로 머지된 merge-in PR을 찾아 제목의 SHA를 파싱,
-  현재 `main` SHA와 비교한다. 일치하면 통과, 다르면(merge-in 이후 main이 또 전진했으면) 차단.
+`sync/*` 브랜치는 보호 대상이 아니므로 개발자가 자유롭게 push할 수 있다.
+PR 머지는 App이 merge commit으로 처리하므로 release/*에 직접 push하지 않아도 된다.
+
+### 3.4 verify-sync — ancestry 기반 검증
+
+merge commit은 git ancestry를 보존하므로, `git merge-base --is-ancestor` 한 줄로
+검증할 수 있다. 이전 squash 방식의 취약한 "PR 제목 SHA 파싱" 로직을 완전히 제거했다.
+
+```bash
+# main이 release/*의 조상이면 merge-in 완료 → 통과
+git merge-base --is-ancestor origin/main origin/$HEAD_BRANCH
+```
 
 ## 4. 검증 결과
 
@@ -75,34 +101,67 @@ scripts/sync-release.sh                   # 축 3 — 수동 merge-in 헬퍼
 |-----------|------|------|
 | 보호 브랜치 force push 거부 | ✅ | `GH013: push declined`, 테스트 전부 거부 |
 | 보호 브랜치 삭제 거부 | ✅ | deletion 룰 적용 확인 |
-| merge-in 무 force push·무손실 | ✅ | PR #3/#7/#8 squash merge, force push 0건 |
+| merge-in 무 force push·무손실 | ✅ | merge commit push, force push 0건 |
 | 기존 커밋 SHA 불변 | ✅ | release/1·hotfix/1 히스토리 보존 |
-| `auto-merge-in` 자동 발화 | ✅ | main 전진 시 PR #7(hotfix/1)·#8(release/1) 자동 생성+머지 |
-| `verify-sync` 통과 | ✅ | PR #9에서 merge-in PR #8 탐지, SHA(`7ecc854`) 일치 → SUCCESS |
+| `auto-merge-in` 자동 발화 | ✅ | main 전진 시 release/*, hotfix/* merge commit 자동 push |
+| `verify-sync` 통과 | ✅ | ancestry 확인으로 merge-in 완료 검증 |
 | `detect-force-push` | ✅ | force push 없어 `skipped` (정상 — 이중방어) |
-
-**가설 ①② 모두 입증.** merge-in은 force push·손실 없이 동기화되고, 자동화가 동기화 toil을 제거했다.
 
 ## 5. 프로덕션 이행 체크리스트
 
-### 5.1 저장소 설정
+### 5.1 GitHub App 생성 (1회성, org 단위)
 
-시범 구축 중 기본값에서 변경해야 했던 항목들이다. 프로덕션 저장소에서도 동일하게 적용한다.
+- [ ] **GitHub App 생성** (org 소유)
+  - App 이름 예시: `release-sync-bot`
+  - Repository permissions:
+    - Contents: **Read & write**
+    - Pull requests: **Read & write**
+    - Workflows: **Read & write** ⚠️ (main 머지분에 워크플로 파일 포함 시 필수)
+    - Metadata: Read-only (자동)
+  - Organization / Account permissions: 전부 **No access**
+
+- [ ] **App 설치** — "Only select repositories"로 대상 저장소들에만 설치
+
+- [ ] **자격증명 저장**
+  ```bash
+  # App ID (숫자) → org/repo variable
+  gh variable set SYNC_APP_ID --body "<app-id>" --org <org>
+  # Private key (.pem 내용) → org/repo secret
+  gh secret set SYNC_APP_PRIVATE_KEY --body "$(cat app-key.pem)" --org <org>
+  ```
+
+### 5.2 룰셋 설정
+
+- [ ] **`release/**`·`hotfix/**` 룰셋**
+  - `non_fast_forward` (force push 차단)
+  - `deletion` (브랜치 삭제 차단)
+  - `pull_request` (직접 push 차단 — PR 필수)
+  - `allowed_merge_methods`: **squash-only** 유지 (feature→release squash 강제)
+  - **Bypass list에 App 추가**, 모드: **Always**
+    - "Always"를 선택해야 PR 밖 직접 push(정상 경로)가 통과된다.
+    - "Pull requests only"로는 정상 경로 직접 push가 차단된다.
+
+- [ ] **`main` 룰셋**
+  - `non_fast_forward`, `deletion`, `pull_request` 동일 적용
+  - Bypass list에 App 추가는 불필요 (App은 main에 push하지 않음)
+
+- [ ] **`sync/**` 브랜치는 보호 대상에서 제외**
+  - 개발자가 충돌 해소 후 자유롭게 push할 수 있어야 한다.
+
+### 5.3 저장소 일반 설정
 
 - [ ] **Settings → Actions → General → Workflow permissions**
   - `Read and write` 선택
   - **"Allow GitHub Actions to create and approve pull requests" 체크**
   - CLI: `gh api -X PUT repos/<org>/<repo>/actions/permissions/workflow --field default_workflow_permissions=write --field can_approve_pull_request_reviews=true`
-  - ⚠️ 미설정 시 `auto-merge-in`이 PR을 못 만든다 (`GitHub Actions is not permitted to create or approve pull requests`).
 
 - [ ] **Settings → General → "Allow auto-merge" 활성화**
   - CLI: `gh api -X PATCH repos/<org>/<repo> --field allow_auto_merge=true`
 
-- [ ] `default_branch`가 `main`인지 확인.
+### 5.4 워크플로 이식 및 required check 등록
 
-### 5.2 워크플로 이식
+- [ ] 워크플로 5종 복사: `detect-force-push.yml`, `verify-sync.yml`, `auto-merge-in.yml`, `resolve-merge-in.yml`, `scripts/sync-release.sh`
 
-- [ ] 워크플로 4종을 그대로 복사: `detect-force-push.yml`, `verify-sync.yml`, `auto-merge-in.yml`, `scripts/sync-release.sh`
 - [ ] `verify-sync`의 `check` job을 `main` 룰셋의 **required status check**로 등록
   ```bash
   # integration_id 15368 = GitHub Actions
@@ -121,58 +180,56 @@ scripts/sync-release.sh                   # 축 3 — 수동 merge-in 헬퍼
   }
   JSON
   ```
-  > ⚠️ 이 API 호출은 룰셋 전체를 덮어쓴다. 기존 규칙(deletion, non_fast_forward, pull_request)을 함께 포함시켜야 한다.
+  > ⚠️ 이 API 호출은 룰셋 전체를 덮어쓴다. 기존 규칙을 함께 포함해야 한다.
 
-### 5.3 룰셋
+- [ ] `resolve-merge-in`의 `conflict-check` job을 `release/**`·`hotfix/**` 룰셋의 **required status check**로 등록
+  - context 이름: `conflict-check`
+  - sync PR이 충돌 마커 남긴 채 머지되는 것을 차단한다.
 
-- [ ] `main`·`release/**`·`hotfix/**` 룰셋에 동일 규칙 적용:
-  - `non_fast_forward` (force push 차단)
-  - `deletion` (브랜치 삭제 차단)
-  - `pull_request` (직접 push 차단, 승인 수는 팀 정책에 따라)
+### 5.5 가시성
 
-- [ ] **결정 필요**: release/hotfix 룰셋의 `allowed_merge_methods`
-
-  | 선택지 | 장점 | 단점 |
-  |--------|------|------|
-  | squash-only 유지 | 현 설계 그대로 사용 가능 | `verify-sync`가 PR 제목 파싱에 의존(취약) |
-  | merge commit 허용 추가 | `git merge-base --is-ancestor`로 단순화 가능, ancestry 추적 정확 | 머지 커밋이 히스토리에 남음 |
-
-  프로덕션 팀이 선택. 현재 설계는 squash-only를 전제로 동작한다.
-
-### 5.4 가시성
-
-- [ ] `SLACK_WEBHOOK_URL`을 repo Secret으로 등록
+- [ ] `SLACK_WEBHOOK_URL`을 repo/org Secret으로 등록
   - 미등록 시 알림 스텝은 조건부 skip, 워크플로는 정상 동작
-  - `gh secret set SLACK_WEBHOOK_URL --body "<webhook-url>" --repo <org>/<repo>`
+  - `gh secret set SLACK_WEBHOOK_URL --body "<webhook-url>" --org <org>`
 
-## 6. 미해결 합의 항목 (시범 범위 밖)
+## 6. end-to-end 검증 순서
+
+프로덕션 이행 전 아래 순서로 테스트 저장소에서 확인한다.
+
+1. **App bypass 확인**: main에 무충돌 커밋 push → `auto-merge-in` 실행 → `release/*`에 merge commit 직접 push 성공 → `git merge-base --is-ancestor origin/main origin/release/*` true
+2. **verify-sync pass**: release/*→main PR 생성 → merge-in 후 `check` 통과
+3. **충돌 경로**: release/*와 main이 같은 줄을 다르게 수정 → main push → `sync/main-to-*` 브랜치+PR+Slack 확인
+4. **충돌 마커 차단**: 마커 미해소 상태로 머지 시도 → `conflict-check` fail로 차단
+5. **충돌 해소 자동 머지**: 마커 해소 후 push → `resolve-merge-in` 실행 → App 토큰으로 merge commit 머지 → ancestry 통과
+6. **루프 없음**: App이 `release/*`에 push해도 `auto-merge-in`(main 트리거)·`detect-force-push`(forced만) 재실행 없음
+7. **squash 강제**: feature→release PR에서 merge commit 버튼 비활성(squash-only 룰셋)
+
+## 7. 미해결 합의 항목
 
 - **`develop` 브랜치 폐지 시점** — dev 환경 배포 대안이 마련돼야 폐지 가능 (`suggest.md` §5). 팀 합의 필요.
-- **조직 권한 모델 확인** — 시범은 개인 계정(`seungjaey/branch-test1`)이어서 조직 룰셋 bypass 액터 목록, CODEOWNERS, 조직 기본 workflow 권한이 다를 수 있다. 프로덕션 이식 전 재확인.
+- **App 관리 주체** — org 소유 App의 private key 로테이션 주기 및 담당자 지정.
 
-## 7. 주의·한계
+## 8. 주의·한계
 
-### 워크플로 트리거
+### GITHUB_TOKEN으로 생성된 PR의 트리거 제한
 GITHUB_TOKEN으로 생성된 PR은 다른 워크플로를 자동으로 트리거하지 않는다
 ([GitHub 문서](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow)).
-`verify-sync`가 merge-in PR에서 자동 실행되지 않아도 문제 없다(merge-in은 내부 동기화 PR이라 verify-sync 검사 대상이 아님). 다만, `verify-sync`가 release→main PR에서도 트리거되지 않는다면 PAT 또는 `pull_request_target` 이벤트로 전환을 검토한다.
+`resolve-merge-in`은 `push` 트리거(sync 브랜치 push)로 동작하므로 이 제약을 받지 않는다.
 
 ### detect-force-push의 실효성
-룰셋(`non_fast_forward`)이 이미 force push를 플랫폼 수준에서 막기 때문에 `detect-force-push.yml`은 보호 브랜치에서 거의 발화하지 않는다. **감사(audit) 및 bypass 권한 사용자 모니터링** 목적으로 유지한다.
+룰셋(`non_fast_forward`)이 이미 force push를 플랫폼 수준에서 막기 때문에 `detect-force-push.yml`은 보호 브랜치에서 거의 발화하지 않는다. **App bypass 사용자 모니터링** 목적으로 유지한다.
+
+### App 토큰 미설정 시 동작
+`SYNC_APP_ID` / `SYNC_APP_PRIVATE_KEY`가 없으면:
+- 정상 경로(직접 push)가 동작하지 않는다.
+- `auto-merge-in`은 sync 브랜치+PR 경로로 fallback한다.
+- `resolve-merge-in`은 conflict-check만 동작하고 자동 머지는 skip된다(수동 머지 필요).
 
 ### bash 함정 — `jq '// empty'`
-`jq '.[0].number // empty'`는 일부 jq 버전에서 exit code 5를 반환한다. `set -eo pipefail` 환경(GitHub Actions 기본)에서는 스크립트 전체가 실패한다. 반드시 `// ""`를 사용한다.
-
-```bash
-# ❌ 위험
-EXISTING=$(... | jq -r '.[0].number // empty')
-
-# ✅ 안전
-EXISTING=$(... | jq -r '.[0].number // ""')
-```
+`jq '.[0].number // empty'`는 일부 jq 버전에서 exit code 5를 반환한다. `set -eo pipefail` 환경에서는 스크립트 전체가 실패한다. 반드시 `// ""`를 사용한다.
 
 ### 인젝션 방지
-모든 `${{ github.* }}` 표현식은 `env:` 블록을 경유해 환경 변수로 주입하고, 셸에서는 환경 변수를 사용한다. 브랜치명은 셸에서 사용하기 전에 정규식으로 검증한다.
+모든 `${{ github.* }}` 표현식은 `env:` 블록을 경유해 환경 변수로 주입한다. 브랜치명은 셸에서 사용하기 전에 정규식으로 검증한다.
 
 ```yaml
 # ✅ 올바른 패턴

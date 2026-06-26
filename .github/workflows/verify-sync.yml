@@ -1,13 +1,13 @@
-# 축 2 (탐지) — release→main PR 열기 전 동기화 확인
+# release→main PR 열기 전 동기화 확인
 #
 # release/* 또는 hotfix/* 브랜치가 main으로 PR을 열 때,
 # main이 전진한 이후 merge-in(main→release)이 완료됐는지 검증합니다.
 #
-# [squash-only 환경 주의]
-# release 룰셋에서 squash merge만 허용하므로 git ancestry 기반 체크가 불가합니다.
-# 대신 GitHub PR API로 최신 merge-in PR의 main SHA를 추적합니다:
-#   - merge-in PR 제목 형식: "[merge-in] main → <branch> @ <main-sha>"
-#   - merge-in이 없거나 SHA가 현재 main과 다르면 fail.
+# ── merge commit 기반 ancestry 검증 ─────────────────────────────────────
+# auto-merge-in.yml이 merge commit을 사용하므로, main의 커밋이
+# release/* 의 직접 조상(ancestor)으로 남습니다.
+# git merge-base --is-ancestor 한 줄로 명확하게 검증합니다.
+# (이전 squash 방식의 취약한 "PR 제목 SHA 파싱" 로직 제거)
 
 name: verify-sync
 
@@ -33,7 +33,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 브랜치명 검증 (injection 방지)
-        # github.head_ref는 신뢰할 수 없는 입력 — 셸 사용 전에 반드시 검증
         env:
           HEAD_BRANCH: ${{ github.head_ref }}
         run: |
@@ -57,56 +56,21 @@ jobs:
           MERGE_BASE=$(git merge-base "origin/$BASE_BRANCH" "origin/$HEAD_BRANCH")
           MAIN_AHEAD=$(git rev-list --count "$MERGE_BASE..origin/$BASE_BRANCH")
           echo "main_ahead=$MAIN_AHEAD" >> "$GITHUB_OUTPUT"
-          echo "merge_base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
           echo "현재 main은 분기점 대비 $MAIN_AHEAD 커밋 앞서 있습니다."
 
-      - name: merge-in 완료 여부 검증
+      - name: merge-in 완료 여부 검증 (ancestry 확인)
         if: steps.check_diverge.outputs.main_ahead != '0'
         env:
-          GH_TOKEN: ${{ github.token }}
           HEAD_BRANCH: ${{ github.head_ref }}
-          CURRENT_MAIN_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           echo "main이 분기점 이후 전진함 → merge-in 완료 여부를 확인합니다."
 
-          # 최신 merge-in PR 조회 (제목: "[merge-in] main → <branch> @ <sha>")
-          MERGE_IN_PR=$(gh pr list \
-            --repo "$GITHUB_REPOSITORY" \
-            --base "$HEAD_BRANCH" \
-            --state merged \
-            --limit 10 \
-            --json title,mergedAt \
-            | jq '[.[] | select(.title | test("^\\[merge-in\\] main →"))] | sort_by(.mergedAt) | last')
-
-          if [ "$MERGE_IN_PR" = "null" ] || [ -z "$MERGE_IN_PR" ]; then
-            echo "::error::merge-in PR이 없습니다. main → $HEAD_BRANCH merge-in을 먼저 완료하세요."
-            echo "::error::수동 실행: bash scripts/sync-release.sh $HEAD_BRANCH"
-            exit 1
-          fi
-
-          # PR 제목에서 main SHA 추출: "[merge-in] main → release/1 @ f273cf7"
-          MERGE_IN_TITLE=$(echo "$MERGE_IN_PR" | jq -r '.title')
-          SYNCED_SHA=$(echo "$MERGE_IN_TITLE" | grep -oE '[0-9a-f]{7,40}$' || true)
-
-          echo "마지막 merge-in PR 제목: $MERGE_IN_TITLE"
-          echo "merge-in 당시 main SHA: $SYNCED_SHA"
-          echo "현재 main SHA:          $CURRENT_MAIN_SHA"
-
-          if [ -z "$SYNCED_SHA" ]; then
-            echo "::warning::merge-in PR 제목에서 SHA를 파싱하지 못했습니다. merge-in PR 제목 형식을 확인하세요."
-            echo "::warning::형식: '[merge-in] main → <branch> @ <sha>'"
-            # 제목 파싱 실패 시 PR 존재만으로 pass (관대한 fallback)
-            exit 0
-          fi
-
-          # SHA가 current main의 prefix인지 확인 (short SHA 7자 vs full SHA 40자 비교)
-          if echo "$CURRENT_MAIN_SHA" | grep -q "^$SYNCED_SHA"; then
-            echo "✅ merge-in이 현재 main과 동기화돼 있습니다."
+          if git merge-base --is-ancestor "origin/main" "origin/$HEAD_BRANCH"; then
+            echo "✅ main이 $HEAD_BRANCH의 조상입니다. merge-in 완료."
           else
-            echo "::error::main이 merge-in 이후 추가로 전진했습니다."
-            echo "::error::  merge-in 당시: $SYNCED_SHA"
-            echo "::error::  현재 main:     $CURRENT_MAIN_SHA"
-            echo "::error::main → $HEAD_BRANCH merge-in을 다시 실행하세요."
+            echo "::error::main이 $HEAD_BRANCH에 merge-in되지 않았습니다."
+            echo "::error::auto-merge-in 워크플로가 완료될 때까지 기다리거나,"
+            echo "::error::충돌이 있는 경우 sync/* PR을 먼저 해소·머지하세요."
             exit 1
           fi
 
